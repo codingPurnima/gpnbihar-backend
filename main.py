@@ -2,7 +2,7 @@ import os
 import secrets
 import time
 from uuid import uuid4
-
+from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -19,6 +19,17 @@ from pydantic import BaseModel
 load_dotenv()
 
 app = FastAPI(title="GPNBIHAR Recording API")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
+)
+
 bearer = HTTPBearer()
 
 LIVEKIT_URL = os.environ["LIVEKIT_URL"]
