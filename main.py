@@ -153,15 +153,6 @@ async def create_guest_session(request: GuestSessionRequest):
         "room_name": ROOM_NAME,
     }
 
-def require_admin(
-    credentials: HTTPAuthorizationCredentials = Depends(bearer),
-):
-    if not secrets.compare_digest(
-        credentials.credentials, STUDIO_ADMIN_TOKEN
-    ):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-
 @app.get("/health")
 async def health():
     return {"status": "ok"}
@@ -354,7 +345,7 @@ async def recording_status(egress_id: str):
     }
 
 
-@app.get("/debug/egress/{egress_id}", dependencies=[Depends(require_admin)])
+@app.get("/debug/egress/{egress_id}", dependencies=[Depends(require_anchor)])
 async def debug_egress(
     egress_id: str,
 ):
