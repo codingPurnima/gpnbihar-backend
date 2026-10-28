@@ -14,7 +14,7 @@ import hmac
 import json
 from datetime import datetime, timedelta, timezone
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 load_dotenv()
 
@@ -115,6 +115,42 @@ def require_anchor(
 ROOM_NAME = "gpnbihar-poc-room"
 active_egress_id: str | None = None
 
+
+
+
+class GuestSessionRequest(BaseModel):
+    name: str = Field(default="Browser Guest", max_length=60)
+
+
+@app.post("/guest/session")
+async def create_guest_session(request: GuestSessionRequest):
+    guest_name = request.name.strip() or "Browser Guest"
+
+    token = (
+        api.AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
+        .with_identity(f"guest-{uuid4()}")
+        .with_name(guest_name)
+        .with_grants(
+            api.VideoGrants(
+                room_join=True,
+                room=ROOM_NAME,
+                can_publish=True,
+                can_subscribe=True,
+            )
+        )
+        .with_ttl(timedelta(hours=2))
+        .to_jwt()
+    )
+
+    client_url = LIVEKIT_URL.replace(
+        "https://", "wss://"
+    ).replace("http://", "ws://")
+
+    return {
+        "server_url": client_url,
+        "livekit_token": token,
+        "room_name": ROOM_NAME,
+    }
 
 def require_admin(
     credentials: HTTPAuthorizationCredentials = Depends(bearer),
