@@ -50,7 +50,7 @@ S3_SECRET_KEY = os.environ["SUPABASE_S3_SECRET_KEY"]
 STUDIO_ADMIN_TOKEN = os.environ["STUDIO_ADMIN_TOKEN"]
 ANCHOR_ACCESS_CODE = os.environ.get("ANCHOR_ACCESS_CODE", "")
 SESSION_TTL_SECONDS = 4 * 60 * 60
-GUEST_INVITE_TTL_SECONDS = 15 * 60
+GUEST_INVITE_TTL_SECONDS = 4 * 60 * 60  # 4 hours
 MAX_STUDIO_PARTICIPANTS = 8
 
 
@@ -122,8 +122,6 @@ def require_anchor(
 ROOM_NAME = "gpnbihar-poc-room"
 active_egress_id: str | None = None
 recording_keys: dict[str, str] = {}
-guest_invitations: dict[str, dict] = {}
-guest_invitation_lock = asyncio.Lock()
 
 
 class GuestSessionRequest(BaseModel):
@@ -174,54 +172,75 @@ async def ensure_room_capacity() -> None:
         )
 
 
+def create_guest_invite_token() -> str:
+    payload = {
+        "scope": "guest_invite",
+        "room": ROOM_NAME,
+        "exp": int(time.time()) + GUEST_INVITE_TTL_SECONDS,
+    }
+
+    encoded = encode_part(
+        json.dumps(payload, separators=(",", ":")).encode()
+    )
+
+    signature = hmac.new(
+        STUDIO_ADMIN_TOKEN.encode(),
+        encoded.encode(),
+        hashlib.sha256,
+    ).digest()
+
+    return f"{encoded}.{encode_part(signature)}"
+
+
+def validate_guest_invite_token(token: str) -> None:
+    try:
+        encoded, supplied_signature = token.split(".", 1)
+
+        expected_signature = hmac.new(
+            STUDIO_ADMIN_TOKEN.encode(),
+            encoded.encode(),
+            hashlib.sha256,
+        ).digest()
+
+        if not hmac.compare_digest(
+            expected_signature,
+            decode_part(supplied_signature),
+        ):
+            raise ValueError("Invalid signature")
+
+        payload = json.loads(decode_part(encoded))
+
+        if payload.get("scope") != "guest_invite":
+            raise ValueError("Invalid invitation scope")
+
+        if payload.get("room") != ROOM_NAME:
+            raise ValueError("Invalid invitation room")
+
+        if payload.get("exp", 0) <= int(time.time()):
+            raise ValueError("Invitation expired")
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or expired guest invitation. Ask the anchor for a new link.",
+        ) from exc
+
+
 @app.post("/guest/invite", dependencies=[Depends(require_anchor)])
 async def create_guest_invitation():
-    now = int(time.time())
-    token = secrets.token_urlsafe(32)
-
-    async with guest_invitation_lock:
-        expired = [
-            key for key, value in guest_invitations.items()
-            if value["expires_at"] <= now or value["used"]
-        ]
-        for key in expired:
-            guest_invitations.pop(key, None)
-
-        guest_invitations[token] = {
-            "expires_at": now + GUEST_INVITE_TTL_SECONDS,
-            "used": False,
-        }
-
     return {
-        "invitation_token": token,
+        "invitation_token": create_guest_invite_token(),
         "expires_in": GUEST_INVITE_TTL_SECONDS,
     }
 
 
 @app.post("/guest/session")
 async def create_guest_session(request: GuestSessionRequest):
+    validate_guest_invite_token(request.invitation_token)
+
     guest_name = request.name.strip() or "Browser Guest"
-    now = int(time.time())
 
-    async with guest_invitation_lock:
-        invitation = guest_invitations.get(request.invitation_token)
-        if not invitation:
-            raise HTTPException(
-                status_code=401,
-                detail="Invalid guest invitation. Ask the anchor for a new link.",
-            )
-        if invitation["used"]:
-            raise HTTPException(
-                status_code=401,
-                detail="This guest invitation has already been used.",
-            )
-        if invitation["expires_at"] <= now:
-            guest_invitations.pop(request.invitation_token, None)
-            raise HTTPException(
-                status_code=401,
-                detail="Guest invitation expired. Ask the anchor for a new link.",
-            )
-
+    try:
         async with api.LiveKitAPI(
             LIVEKIT_URL,
             api_key=LIVEKIT_API_KEY,
@@ -230,13 +249,24 @@ async def create_guest_session(request: GuestSessionRequest):
             participants = await lkapi.room.list_participants(
                 api.ListParticipantsRequest(room=ROOM_NAME)
             )
+
             if len(participants.participants) >= MAX_STUDIO_PARTICIPANTS:
                 raise HTTPException(
                     status_code=409,
-                    detail="The studio is full. The maximum is 8 people, including the anchor.",
+                    detail=(
+                        "The studio is full. The maximum is 8 people, "
+                        "including the anchor."
+                    ),
                 )
 
-        invitation["used"] = True
+    except HTTPException:
+        raise
+    except Exception as exc:
+        print(f"Could not check studio capacity: {exc}")
+        raise HTTPException(
+            status_code=502,
+            detail="Could not verify studio capacity. Please try again.",
+        ) from exc
 
     token = (
         api.AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
