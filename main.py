@@ -8,6 +8,8 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from livekit import api
 
+import asyncio
+
 import base64
 import hashlib
 import hmac
@@ -120,14 +122,91 @@ ROOM_NAME = "gpnbihar-poc-room"
 active_egress_id: str | None = None
 recording_keys: dict[str, str] = {}
 
+GUEST_INVITE_TTL_SECONDS = 15 * 60
+MAX_STUDIO_PARTICIPANTS = 8
+
+# Temporary V1 storage. Invitations reset if the backend restarts.
+guest_invitations: dict[str, dict] = {}
+guest_invitation_lock = asyncio.Lock()
 
 class GuestSessionRequest(BaseModel):
+    invitation_token: str = Field(min_length=32, max_length=200)
     name: str = Field(default="Browser Guest", max_length=60)
+
+@app.post(
+    "/guest/invite",
+    dependencies=[Depends(require_anchor)],
+)
+async def create_guest_invitation():
+    invitation_token = secrets.token_urlsafe(32)
+
+    async with guest_invitation_lock:
+        guest_invitations[invitation_token] = {
+            "expires_at": int(time.time()) + GUEST_INVITE_TTL_SECONDS,
+            "used": False,
+        }
+
+    return {
+        "invitation_token": invitation_token,
+        "expires_in": GUEST_INVITE_TTL_SECONDS,
+    }
 
 
 @app.post("/guest/session")
 async def create_guest_session(request: GuestSessionRequest):
     guest_name = request.name.strip() or "Browser Guest"
+    invitation_token = request.invitation_token
+
+    # Serialize redemptions within this backend process.
+    async with guest_invitation_lock:
+        invitation = guest_invitations.get(invitation_token)
+
+        if not invitation:
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid invitation link.",
+            )
+
+        if invitation["used"]:
+            raise HTTPException(
+                status_code=401,
+                detail="This invitation has already been used.",
+            )
+
+        if invitation["expires_at"] <= int(time.time()):
+            guest_invitations.pop(invitation_token, None)
+            raise HTTPException(
+                status_code=401,
+                detail="This invitation has expired. Ask the anchor for a new one.",
+            )
+
+        # Check the live room before consuming the invitation.
+        try:
+            async with api.LiveKitAPI(
+                LIVEKIT_URL,
+                api_key=LIVEKIT_API_KEY,
+                api_secret=LIVEKIT_API_SECRET,
+            ) as lkapi:
+                result = await lkapi.room.list_participants(
+                    api.ListParticipantsRequest(room=ROOM_NAME)
+                )
+                participant_count = len(result.participants)
+
+        except Exception as exc:
+            print(f"Participant check failed: {exc}")
+            raise HTTPException(
+                status_code=503,
+                detail="Could not verify studio capacity. Please try again.",
+            ) from exc
+
+        if participant_count >= MAX_STUDIO_PARTICIPANTS:
+            raise HTTPException(
+                status_code=409,
+                detail="The studio is full. The maximum is 1 anchor and 7 guests.",
+            )
+
+        # Consume only after the checks succeed.
+        invitation["used"] = True
 
     token = (
         api.AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
@@ -141,7 +220,7 @@ async def create_guest_session(request: GuestSessionRequest):
                 can_subscribe=True,
             )
         )
-        .with_ttl(timedelta(hours=2))
+        .with_ttl(timedelta(minutes=30))
         .to_jwt()
     )
 
@@ -154,6 +233,7 @@ async def create_guest_session(request: GuestSessionRequest):
         "livekit_token": token,
         "room_name": ROOM_NAME,
     }
+
 
 @app.get("/health")
 async def health():
