@@ -8,6 +8,14 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from livekit import api
 
+import base64
+import hashlib
+import hmac
+import json
+from datetime import datetime, timedelta, timezone
+
+from pydantic import BaseModel
+
 load_dotenv()
 
 app = FastAPI(title="GPNBIHAR Recording API")
@@ -24,6 +32,74 @@ S3_ACCESS_KEY = os.environ["SUPABASE_S3_ACCESS_KEY"]
 S3_SECRET_KEY = os.environ["SUPABASE_S3_SECRET_KEY"]
 
 STUDIO_ADMIN_TOKEN = os.environ["STUDIO_ADMIN_TOKEN"]
+ANCHOR_ACCESS_CODE = os.environ.get("ANCHOR_ACCESS_CODE", "")
+SESSION_TTL_SECONDS = 4 * 60 * 60
+
+
+class AnchorSessionRequest(BaseModel):
+    access_code: str
+
+
+def encode_part(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).decode().rstrip("=")
+
+
+def decode_part(value: str) -> bytes:
+    return base64.urlsafe_b64decode(
+        value + "=" * (-len(value) % 4)
+    )
+
+
+def create_anchor_session() -> str:
+    payload = {
+        "scope": "anchor",
+        "exp": int(time.time()) + SESSION_TTL_SECONDS,
+    }
+
+    encoded = encode_part(
+        json.dumps(payload, separators=(",", ":")).encode()
+    )
+
+    signature = hmac.new(
+        STUDIO_ADMIN_TOKEN.encode(),
+        encoded.encode(),
+        hashlib.sha256,
+    ).digest()
+
+    return f"{encoded}.{encode_part(signature)}"
+
+
+def require_anchor(
+    credentials: HTTPAuthorizationCredentials = Depends(bearer),
+):
+    try:
+        encoded, supplied_signature = credentials.credentials.split(".", 1)
+
+        expected_signature = hmac.new(
+            STUDIO_ADMIN_TOKEN.encode(),
+            encoded.encode(),
+            hashlib.sha256,
+        ).digest()
+
+        if not hmac.compare_digest(
+            expected_signature,
+            decode_part(supplied_signature),
+        ):
+            raise ValueError("Invalid signature")
+
+        payload = json.loads(decode_part(encoded))
+
+        if payload.get("scope") != "anchor":
+            raise ValueError("Invalid scope")
+
+        if payload.get("exp", 0) <= int(time.time()):
+            raise ValueError("Session expired")
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or expired anchor session",
+        ) from exc
 
 ROOM_NAME = "gpnbihar-poc-room"
 active_egress_id: str | None = None
@@ -42,8 +118,63 @@ def require_admin(
 async def health():
     return {"status": "ok"}
 
+@app.post("/anchor/session")
+async def create_anchor_session_endpoint(
+    request: AnchorSessionRequest,
+):
+    if not ANCHOR_ACCESS_CODE:
+        raise HTTPException(
+            status_code=503,
+            detail="Anchor access is not configured",
+        )
+
+    if not secrets.compare_digest(
+        request.access_code,
+        ANCHOR_ACCESS_CODE,
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid anchor access code",
+        )
+
+    livekit_token = (
+        api.AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET)
+        .with_identity("gpnbihar-anchor-poc")
+        .with_name("GPNBIHAR Anchor")
+        .with_grants(
+            api.VideoGrants(
+                room_join=True,
+                room=ROOM_NAME,
+                can_publish=True,
+                can_subscribe=True,
+            )
+        )
+        .with_ttl(timedelta(hours=4))
+        .to_jwt()
+    )
+
+    client_url = LIVEKIT_URL
+    if client_url.startswith("https://"):
+        client_url = "wss://" + client_url[len("https://"):]
+    elif client_url.startswith("http://"):
+        client_url = "ws://" + client_url[len("http://"):]
+
+    return {
+        "server_url": client_url,
+        "livekit_token": livekit_token,
+        "session_token": create_anchor_session(),
+        "room_name": ROOM_NAME,
+        "identity": "gpnbihar-anchor-poc",
+    }
+
 @app.post("/recording/start", dependencies=[Depends(require_admin)])
 async def start_news_recording(room_name: str):
+    if room_name != ROOM_NAME:
+        raise HTTPException(
+            status_code=403,
+            detail="Unauthorized room",
+        )
+
     global active_egress_id
 
     # Point this to your deployed Vite recorder app on Vercel
@@ -172,7 +303,7 @@ async def recording_status(egress_id: str):
     }
 
 
-@app.get("/debug/egress/{egress_id}")
+@app.get("/debug/egress/{egress_id}", dependencies=[Depends(require_admin)])
 async def debug_egress(
     egress_id: str,
 ):
