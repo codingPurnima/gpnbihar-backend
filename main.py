@@ -215,7 +215,10 @@ async def create_anchor_session_endpoint(
         "identity": "gpnbihar-anchor-poc",
     }
 
-@app.post("/recording/start", dependencies=[Depends(require_admin)])
+@app.post(
+    "/recording/start",
+    dependencies=[Depends(require_anchor)],
+)
 async def start_news_recording(room_name: str):
     if room_name != ROOM_NAME:
         raise HTTPException(
@@ -268,7 +271,7 @@ async def start_news_recording(room_name: str):
         "status": str(response.status),
     }
 
-@app.post("/recording/stop", dependencies=[Depends(require_admin)])
+@app.post("/recording/stop", dependencies=[Depends(require_anchor)])
 async def stop_recording():
     global active_egress_id
 
@@ -307,7 +310,7 @@ async def stop_recording():
 
 @app.get(
     "/recording/status/{egress_id}",
-    dependencies=[Depends(require_admin)],
+    dependencies=[Depends(require_anchor)],
 )
 async def recording_status(egress_id: str):
     try:
