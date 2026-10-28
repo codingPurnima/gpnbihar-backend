@@ -248,12 +248,35 @@ async def start_news_recording(room_name: str):
         ),
     )
 
-    async with api.LiveKitAPI(
-        LIVEKIT_URL,
-        api_key=LIVEKIT_API_KEY,
-        api_secret=LIVEKIT_API_SECRET,
-    ) as lkapi:
-        response = await lkapi.egress.start_room_composite_egress(egress_request)
+    
+    try:
+        async with api.LiveKitAPI(
+            LIVEKIT_URL,
+            api_key=LIVEKIT_API_KEY,
+            api_secret=LIVEKIT_API_SECRET,
+        ) as lkapi:
+            response = await lkapi.egress.start_room_composite_egress(
+                egress_request
+            )
+
+    except Exception as exc:
+        error_message = str(exc).lower()
+        print(f"Recording start failed: {exc}")
+
+        if "egress minutes exceeded" in error_message:
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    "LiveKit recording quota exhausted. "
+                    "Recording is unavailable until the quota resets "
+                    "or the plan is upgraded."
+                ),
+            ) from exc
+
+        raise HTTPException(
+            status_code=502,
+            detail="LiveKit could not start recording. Check backend logs.",
+        ) from exc
 
     active_egress_id = response.egress_id
 
