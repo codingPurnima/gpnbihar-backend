@@ -16,6 +16,9 @@ from datetime import datetime, timedelta, timezone
 
 from pydantic import BaseModel, Field
 
+import boto3
+from botocore.config import Config
+
 load_dotenv()
 
 app = FastAPI(title="GPNBIHAR Recording API")
@@ -115,8 +118,7 @@ def require_anchor(
 
 ROOM_NAME = "gpnbihar-poc-room"
 active_egress_id: str | None = None
-
-
+recording_keys: dict[str, str] = {}
 
 
 class GuestSessionRequest(BaseModel):
@@ -206,6 +208,7 @@ async def create_anchor_session_endpoint(
         "identity": "gpnbihar-anchor-poc",
     }
 
+
 @app.post(
     "/recording/start",
     dependencies=[Depends(require_anchor)],
@@ -219,15 +222,15 @@ async def start_news_recording(room_name: str):
 
     global active_egress_id
 
-    # Point this to your deployed Vite recorder app on Vercel
     recorder_template_url = "https://gpnbihar-recorder-end.vercel.app/"
 
-    # Ensure S3 endpoint is a valid absolute URI
     s3_endpoint = S3_ENDPOINT.strip()
-    if not s3_endpoint.startswith("http://") and not s3_endpoint.startswith("https://"):
+    if not s3_endpoint.startswith(("http://", "https://")):
         s3_endpoint = f"https://{s3_endpoint}"
-    # Remove any trailing slashes
     s3_endpoint = s3_endpoint.rstrip("/")
+
+    # Save the exact key so we can generate its download URL later.
+    recording_key = f"recordings/{room_name}-{int(time.time())}.mp4"
 
     egress_request = api.RoomCompositeEgressRequest(
         room_name=room_name,
@@ -236,19 +239,18 @@ async def start_news_recording(room_name: str):
         preset=api.EncodingOptionsPreset.H264_1080P_30,
         file=api.EncodedFileOutput(
             file_type=api.EncodedFileType.MP4,
-            filepath=f"recordings/{room_name}-{int(time.time())}.mp4",
+            filepath=recording_key,
             s3=api.S3Upload(
                 endpoint=s3_endpoint,
-                region=S3_REGION or "us-east-1",  # Supabase requires a region string
+                region=S3_REGION or "ap-southeast-2",
                 bucket=S3_BUCKET,
                 access_key=S3_ACCESS_KEY,
                 secret=S3_SECRET_KEY,
-                force_path_style=True,  # Mandatory for Supabase S3 storage
+                force_path_style=True,
             ),
         ),
     )
 
-    
     try:
         async with api.LiveKitAPI(
             LIVEKIT_URL,
@@ -279,6 +281,7 @@ async def start_news_recording(room_name: str):
         ) from exc
 
     active_egress_id = response.egress_id
+    recording_keys[response.egress_id] = recording_key
 
     return {
         "egress_id": response.egress_id,
@@ -367,6 +370,62 @@ async def recording_status(egress_id: str):
         ],
     }
 
+@app.get(
+    "/recording/download/{egress_id}",
+    dependencies=[Depends(require_anchor)],
+)
+async def get_recording_download(egress_id: str):
+    recording_key = recording_keys.get(egress_id)
+
+    if not recording_key:
+        raise HTTPException(
+            status_code=404,
+            detail="Recording not found. Start a new recording first.",
+        )
+
+    endpoint = S3_ENDPOINT.strip().rstrip("/")
+    if not endpoint.startswith(("http://", "https://")):
+        endpoint = f"https://{endpoint}"
+
+    try:
+        s3 = boto3.client(
+            "s3",
+            endpoint_url=endpoint,
+            region_name=S3_REGION or "ap-southeast-2",
+            aws_access_key_id=S3_ACCESS_KEY,
+            aws_secret_access_key=S3_SECRET_KEY,
+            config=Config(
+                signature_version="s3v4",
+                s3={"addressing_style": "path"},
+            ),
+        )
+
+        filename = recording_key.rsplit("/", 1)[-1]
+
+        download_url = s3.generate_presigned_url(
+            "get_object",
+            Params={
+                "Bucket": S3_BUCKET,
+                "Key": recording_key,
+                "ResponseContentDisposition": (
+                    f'attachment; filename="{filename}"'
+                ),
+            },
+            ExpiresIn=900,
+        )
+
+        return {
+            "download_url": download_url,
+            "filename": filename,
+            "expires_in": 900,
+        }
+
+    except Exception as exc:
+        print(f"Download URL generation failed: {exc}")
+        raise HTTPException(
+            status_code=502,
+            detail="Could not generate recording download link.",
+        ) from exc
 
 @app.get("/debug/egress/{egress_id}", dependencies=[Depends(require_anchor)])
 async def debug_egress(
